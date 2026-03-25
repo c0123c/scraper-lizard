@@ -342,7 +342,7 @@ JSON.stringify((() => {
       text: normalize(a.innerText || a.textContent || a.getAttribute('title') || ''),
       containerText: normalize((a.closest('li, article, section, div')?.innerText) || '')
     }))
-    .filter((item) => /^https:\/\/www\.1point3acres\.com\/home\/pins\/\d+$/i.test(item.href))
+    .filter((item) => new RegExp('^https://www\\\\.1point3acres\\\\.com/home/pins/\\\\d+$', 'i').test(item.href))
     .filter((item) => item.text || item.containerText);
   const nextCandidates = anchors
     .map((a) => ({
@@ -633,6 +633,11 @@ def expand_keyword_urls(keyword: str, sites: list[str], limit_per_site: int, bro
                 result_urls = search_result_urls(query)
             except Exception:
                 result_urls = []
+            if site == "chasedream" and not result_urls:
+                try:
+                    result_urls = browser_search_result_urls(query, browser_profile)
+                except Exception:
+                    result_urls = []
             if site == "chasedream":
                 result_urls = [
                     url for url in result_urls
