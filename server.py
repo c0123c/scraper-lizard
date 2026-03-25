@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import socketserver
 import subprocess
 import sys
@@ -7,7 +8,6 @@ import tempfile
 import threading
 import urllib.request
 import webbrowser
-import shutil
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -50,7 +50,7 @@ HTML_PAGE = """<!doctype html>
       padding: 32px;
     }
     .wrap {
-      max-width: 980px;
+      max-width: 1080px;
       margin: 0 auto;
       display: grid;
       gap: 18px;
@@ -201,11 +201,11 @@ HTML_PAGE = """<!doctype html>
     <section class="hero">
       <div>
         <h1 class="title">爬取小蜥蜴</h1>
-        <p class="sub">上传链接，勾选格式，直接跑批量抓取。</p>
+        <p class="sub">支持 URL 批量抓取，也支持通过关键词先搜索、再自动展开帖子链接。</p>
         <div class="chipbar">
-          <span class="chip">上传 txt 文件</span>
-          <span class="chip">选择 HTML / JSON / DOCX / PDF</span>
-          <span class="chip">显示 OpenClaw 状态</span>
+          <span class="chip">上传 txt / csv 链接文件</span>
+          <span class="chip">关键词模式支持 ChaseDream / 1point3acres</span>
+          <span class="chip">可导出 HTML / JSON / DOCX / PDF</span>
         </div>
       </div>
     </section>
@@ -233,10 +233,26 @@ HTML_PAGE = """<!doctype html>
             <label for="file">Upload URL File</label>
             <input id="file" type="file" accept=".txt,.csv">
           </div>
+          <div style="margin-top:14px;">
+            <label for="keyword">Keyword Mode</label>
+            <input id="keyword" type="text" placeholder="输入关键词后自动搜索并批量展开帖子链接">
+            <div class="hint">当前关键词模式支持 ChaseDream 和 1point3acres。</div>
+          </div>
         </div>
         <div>
           <label for="output">Output Folder</label>
           <input id="output" type="text" value="D:\\openclaw\\文案内容">
+          <div style="margin-top:14px;">
+            <label>Keyword Sites</label>
+            <div class="checks">
+              <div class="check"><input type="checkbox" id="site-chasedream" checked> ChaseDream</div>
+              <div class="check"><input type="checkbox" id="site-1p3a" checked> 1point3acres</div>
+            </div>
+          </div>
+          <div style="margin-top:14px;">
+            <label for="keyword-limit">Keyword Limit / Site</label>
+            <input id="keyword-limit" type="text" value="10">
+          </div>
           <div class="checks">
             <div class="check"><input type="checkbox" id="fmt-html" checked> HTML</div>
             <div class="check"><input type="checkbox" id="fmt-json" checked> JSON</div>
@@ -277,21 +293,30 @@ HTML_PAGE = """<!doctype html>
 
     document.getElementById('run-btn').addEventListener('click', async () => {
       const urls = document.getElementById('urls').value.trim();
+      const keyword = document.getElementById('keyword').value.trim();
       const output = document.getElementById('output').value.trim();
+      const keywordLimit = document.getElementById('keyword-limit').value.trim() || '10';
+      const keywordSites = [
+        ['chasedream', document.getElementById('site-chasedream').checked],
+        ['1point3acres', document.getElementById('site-1p3a').checked],
+      ].filter(x => x[1]).map(x => x[0]);
       const formats = [
         ['html', document.getElementById('fmt-html').checked],
         ['json', document.getElementById('fmt-json').checked],
         ['docx', document.getElementById('fmt-docx').checked],
         ['pdf', document.getElementById('fmt-pdf').checked],
       ].filter(x => x[1]).map(x => x[0]);
-      if (!urls) return alert('请先提供链接。');
+
+      if (!urls && !keyword) return alert('请至少提供 URL 或关键词。');
+      if (keyword && !keywordSites.length) return alert('关键词模式至少选择一个站点。');
       if (!formats.length) return alert('至少选择一种输出格式。');
+
       const result = document.getElementById('result');
       result.textContent = 'Running...';
       const res = await fetch('/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ urls, output, formats })
+        body: JSON.stringify({ urls, keyword, keywordSites, keywordLimit, output, formats })
       });
       result.textContent = JSON.stringify(await res.json(), null, 2);
     });
@@ -308,10 +333,7 @@ def frontend_status():
         resp = urllib.request.urlopen("http://127.0.0.1:5173", timeout=3)
         return {"ok": True, "text": f"HTTP {resp.status} at http://127.0.0.1:5173"}
     except Exception as exc:
-        return {
-            "ok": False,
-            "text": f"Optional UI not running on 5173. {exc}",
-        }
+        return {"ok": False, "text": f"Optional UI not running on 5173. {exc}"}
 
 
 def gateway_status():
@@ -325,6 +347,7 @@ def gateway_status():
                 break
     if not cli:
         return {"ok": False, "text": "Could not find clawdbot/openclaw executable."}
+
     try:
         proc = subprocess.run(
             [cli, "gateway", "status"],
@@ -342,8 +365,7 @@ def gateway_status():
             for line in lines:
                 if any(token in line for token in ("Gateway:", "Port:", "RPC probe:", "Runtime:", "running", "port")):
                     summary.append(line)
-            text = "\n".join(summary[:6]) or "Gateway responded."
-            return {"ok": True, "text": text}
+            return {"ok": True, "text": "\n".join(summary[:6]) or "Gateway responded."}
         if "heap out of memory" in raw.lower():
             return {
                 "ok": False,
@@ -381,14 +403,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/run":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
+
         length = int(self.headers.get("Content-Length", "0"))
         data = json.loads(self.rfile.read(length).decode("utf-8"))
         urls = data.get("urls", "").strip()
+        keyword = data.get("keyword", "").strip()
+        keyword_sites = [item.strip() for item in data.get("keywordSites", []) if item.strip()]
+        keyword_limit = str(data.get("keywordLimit", "10")).strip() or "10"
         output = data.get("output", str(DEFAULT_OUTPUT)).strip() or str(DEFAULT_OUTPUT)
         formats = [item.strip().lower() for item in data.get("formats", []) if item.strip()]
-        if not urls:
-            self._json({"ok": False, "error": "No URLs provided"}, HTTPStatus.BAD_REQUEST)
+
+        if not urls and not keyword:
+            self._json({"ok": False, "error": "No URLs or keyword provided"}, HTTPStatus.BAD_REQUEST)
             return
+
         tmp = tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8", dir=UPLOAD_DIR)
         try:
             tmp.write(urls)
@@ -403,7 +431,12 @@ class Handler(BaseHTTPRequestHandler):
                 "--formats",
                 ",".join(formats),
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+            if keyword:
+                cmd.extend(["--keyword", keyword, "--keyword-limit", keyword_limit])
+                if keyword_sites:
+                    cmd.extend(["--keyword-sites", ",".join(keyword_sites)])
+
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900, check=False)
             self._json(
                 {
                     "ok": proc.returncode == 0,

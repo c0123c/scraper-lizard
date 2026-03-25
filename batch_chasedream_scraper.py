@@ -9,7 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 
 USER_AGENT = (
@@ -22,12 +22,83 @@ OPENCLAW_BROWSER_CLI = NPM_BIN / "clawdbot.cmd"
 DEFAULT_BROWSER_PROFILE = "user"
 FALLBACK_BROWSER_PROFILES = ["user", "my-chrome"]
 OPENCLAW_CONFIG = Path.home() / ".openclaw" / "openclaw.json"
+SEARCH_ENGINES = {
+    "chasedream": "site:chasedream.com/article",
+    "1point3acres": "site:1point3acres.com/home/pins",
+}
 
 
 def fetch_text(url: str) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+def dedupe_keep_order(items: list[str]) -> list[str]:
+    seen = set()
+    output: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        output.append(item)
+    return output
+
+
+def extract_duckduckgo_result_urls(page_html: str) -> list[str]:
+    urls: list[str] = []
+    matches = re.findall(
+        r'class="result__a"[^>]*href="([^"]+)"|href="([^"]+)"[^>]*class="result__a"',
+        page_html,
+    )
+    for pair in matches:
+        raw = pair[0] or pair[1]
+        href = html.unescape(raw)
+        if href.startswith("//duckduckgo.com/l/?"):
+            parsed = urlparse("https:" + href)
+            uddg = parse_qs(parsed.query).get("uddg", [])
+            if uddg:
+                urls.append(unquote(uddg[0]))
+                continue
+        urls.append(href)
+    return dedupe_keep_order(urls)
+
+
+def normalize_keyword_sites(raw_sites: list[str] | None) -> list[str]:
+    if not raw_sites:
+        return ["chasedream", "1point3acres"]
+    mapping = {
+        "cd": "chasedream",
+        "chasedream": "chasedream",
+        "1point3acres": "1point3acres",
+        "1p3a": "1point3acres",
+        "yi-mu-san-fen-di": "1point3acres",
+    }
+    normalized: list[str] = []
+    for item in raw_sites:
+        key = mapping.get(item.strip().lower())
+        if key and key not in normalized:
+            normalized.append(key)
+    if not normalized:
+        raise RuntimeError("Keyword mode did not receive any supported site names.")
+    return normalized
+
+
+def expand_keyword_urls(keyword: str, sites: list[str], limit_per_site: int) -> list[str]:
+    keyword = keyword.strip()
+    if not keyword:
+        raise RuntimeError("Keyword mode requires a non-empty keyword.")
+    all_urls: list[str] = []
+    for site in normalize_keyword_sites(sites):
+        query = f"{SEARCH_ENGINES[site]} {keyword}"
+        search_url = "https://html.duckduckgo.com/html/?q=" + quote(query)
+        result_urls = extract_duckduckgo_result_urls(fetch_text(search_url))
+        if site == "chasedream":
+            result_urls = [url for url in result_urls if re.search(r"https://www\.chasedream\.com/article/\d+", url)]
+        elif site == "1point3acres":
+            result_urls = [url for url in result_urls if re.search(r"https://www\.1point3acres\.com/home/pins/\d+", url)]
+        all_urls.extend(result_urls[:limit_per_site])
+    return dedupe_keep_order(all_urls)
 
 
 def load_gateway_token() -> str:
@@ -755,13 +826,20 @@ def scrape_onepoint3acres(url: str, browser_profile: str) -> dict:
         if name and name not in profiles_to_try:
             profiles_to_try.append(name)
 
+    parsed = urlparse(url)
     last_error = None
     for profile_name in profiles_to_try:
         try:
-            target_id = select_matching_tab(profile_name, url)
+            target_id = None
+            try:
+                target_id = select_matching_tab(profile_name, url)
+            except RuntimeError:
+                if "/home/pins/" in parsed.path:
+                    target_id = browser_open(url, profile_name)
+            if not target_id:
+                raise RuntimeError(f"Could not find or open a browser tab for {url}")
             browser_focus(profile_name, target_id)
-            browser_wait(profile_name, 1200, target_id)
-            parsed = urlparse(url)
+            browser_wait(profile_name, 1800, target_id)
             if "/home/pins/" in parsed.path:
                 return parse_onepoint3acres_pin(fetch_onepoint3acres_pin_payload(target_id), url)
             snapshot_text = browser_snapshot_text(profile_name, target_id)
@@ -844,6 +922,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Batch scrape supported forum/article pages.")
     parser.add_argument("--input", required=True, help="Path to URL list file")
     parser.add_argument("--output", required=True, help="Output directory")
+    parser.add_argument("--keyword", help="Keyword to expand into post URLs before scraping")
+    parser.add_argument(
+        "--keyword-sites",
+        default="chasedream,1point3acres",
+        help="Comma-separated site list for keyword mode: chasedream,1point3acres",
+    )
+    parser.add_argument(
+        "--keyword-limit",
+        type=int,
+        default=10,
+        help="Maximum number of URLs to collect per site in keyword mode",
+    )
     parser.add_argument(
         "--formats",
         default="html,json,pdf",
@@ -871,6 +961,15 @@ def main() -> int:
         for line in input_path.read_text(encoding="utf-8-sig").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
+    if args.keyword:
+        keyword_sites = [item.strip() for item in args.keyword_sites.split(",") if item.strip()]
+        expanded_urls = expand_keyword_urls(args.keyword, keyword_sites, max(args.keyword_limit, 1))
+        print(f"[KEYWORD] {args.keyword}")
+        print(f"[KEYWORD-SITES] {', '.join(normalize_keyword_sites(keyword_sites))}")
+        print(f"[KEYWORD-EXPANDED] {len(expanded_urls)}")
+        for item in expanded_urls:
+            print(f"[URL] {item}")
+        urls = dedupe_keep_order(urls + expanded_urls)
 
     results = []
     for url in urls:
