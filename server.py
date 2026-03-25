@@ -257,11 +257,35 @@ HTML_PAGE = """<!doctype html>
             <label for="keyword-limit">Keyword Limit / Site</label>
             <input id="keyword-limit" type="text" value="10">
           </div>
-          <div class="checks">
-            <div class="check"><input type="checkbox" id="fmt-html" checked> HTML</div>
-            <div class="check"><input type="checkbox" id="fmt-json" checked> JSON</div>
-            <div class="check"><input type="checkbox" id="fmt-docx"> DOCX</div>
-            <div class="check"><input type="checkbox" id="fmt-pdf" checked> PDF</div>
+          <div style="margin-top:14px;">
+            <label>Output Mode</label>
+            <div class="checks">
+              <div class="check"><input type="checkbox" id="save-local" checked> 保存到本地目录</div>
+              <div class="check"><input type="checkbox" id="write-feishu"> 写入飞书文档</div>
+            </div>
+          </div>
+          <div id="local-box" style="margin-top:14px;">
+            <label>Local Formats</label>
+            <div class="checks">
+              <div class="check"><input type="checkbox" id="fmt-html" checked> HTML</div>
+              <div class="check"><input type="checkbox" id="fmt-json" checked> JSON</div>
+              <div class="check"><input type="checkbox" id="fmt-docx"> DOCX</div>
+              <div class="check"><input type="checkbox" id="fmt-pdf" checked> PDF</div>
+            </div>
+            <div class="hint">只有勾选“保存到本地目录”时，才会使用这些格式。</div>
+          </div>
+          <div id="feishu-box" style="margin-top:14px; display:none;">
+            <label for="feishu-doc">Feishu Doc URL / Token</label>
+            <input id="feishu-doc" type="text" placeholder="已有飞书文档链接或 doc_token">
+            <div class="hint">如果这里留空，但填写下方文件夹，脚本会自动创建一篇新文档，并把所有帖子持续写入同一篇里。</div>
+          </div>
+          <div id="feishu-folder-box" style="margin-top:14px; display:none;">
+            <label for="feishu-folder">Feishu Folder URL / Token</label>
+            <input id="feishu-folder" type="text" placeholder="不填文档时，可填写目标文件夹用于自动创建文档">
+          </div>
+          <div id="feishu-title-box" style="margin-top:14px; display:none;">
+            <label for="feishu-title">Feishu Doc Title</label>
+            <input id="feishu-title" type="text" value="抓取汇总">
           </div>
           <div class="actions">
             <button id="run-btn">Start</button>
@@ -288,6 +312,18 @@ HTML_PAGE = """<!doctype html>
     }
 
     document.getElementById('refresh-btn').addEventListener('click', loadStatus);
+
+    function syncOutputMode() {
+      const saveLocal = document.getElementById('save-local').checked;
+      const writeFeishu = document.getElementById('write-feishu').checked;
+      document.getElementById('local-box').style.display = saveLocal ? 'block' : 'none';
+      document.getElementById('feishu-box').style.display = writeFeishu ? 'block' : 'none';
+      document.getElementById('feishu-folder-box').style.display = writeFeishu ? 'block' : 'none';
+      document.getElementById('feishu-title-box').style.display = writeFeishu ? 'block' : 'none';
+    }
+
+    document.getElementById('save-local').addEventListener('change', syncOutputMode);
+    document.getElementById('write-feishu').addEventListener('change', syncOutputMode);
 
     document.getElementById('file').addEventListener('change', async (ev) => {
       const file = ev.target.files[0];
@@ -323,6 +359,11 @@ HTML_PAGE = """<!doctype html>
       const keyword = document.getElementById('keyword').value.trim();
       const output = document.getElementById('output').value.trim();
       const keywordLimit = document.getElementById('keyword-limit').value.trim() || '10';
+      const saveLocal = document.getElementById('save-local').checked;
+      const writeFeishu = document.getElementById('write-feishu').checked;
+      const feishuDoc = document.getElementById('feishu-doc').value.trim();
+      const feishuFolder = document.getElementById('feishu-folder').value.trim();
+      const feishuTitle = document.getElementById('feishu-title').value.trim();
       const keywordSites = [
         ['chasedream', document.getElementById('site-chasedream').checked],
         ['1point3acres', document.getElementById('site-1p3a').checked],
@@ -336,7 +377,9 @@ HTML_PAGE = """<!doctype html>
 
       if (!urls && !keyword) return alert('请至少提供 URL 或关键词。');
       if (keyword && !keywordSites.length) return alert('关键词模式至少选择一个站点。');
-      if (!formats.length) return alert('至少选择一种输出格式。');
+      if (!saveLocal && !writeFeishu) return alert('请至少选择一种输出方式。');
+      if (saveLocal && !formats.length) return alert('保存到本地目录时，至少选择一种输出格式。');
+      if (writeFeishu && !feishuDoc && !feishuFolder) return alert('写入飞书时，请填写已有文档，或填写目标文件夹用于自动创建文档。');
 
       const result = document.getElementById('result');
       result.textContent = 'Running...';
@@ -345,7 +388,7 @@ HTML_PAGE = """<!doctype html>
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           cache: 'no-store',
-          body: JSON.stringify({ urls, keyword, keywordSites, keywordLimit, output, formats })
+          body: JSON.stringify({ urls, keyword, keywordSites, keywordLimit, output, formats, saveLocal, writeFeishu, feishuDoc, feishuFolder, feishuTitle })
         });
         const data = await res.json();
         if (!data.ok) {
@@ -359,6 +402,8 @@ HTML_PAGE = """<!doctype html>
         result.textContent = '[UI] 提交任务失败：' + String(err);
       }
     });
+
+    syncOutputMode();
 
     loadStatus().catch((err) => {
       document.getElementById('frontend-text').textContent = 'Status check failed: ' + String(err);
@@ -537,9 +582,23 @@ class Handler(BaseHTTPRequestHandler):
         keyword_limit = str(data.get("keywordLimit", "10")).strip() or "10"
         output = data.get("output", str(DEFAULT_OUTPUT)).strip() or str(DEFAULT_OUTPUT)
         formats = [item.strip().lower() for item in data.get("formats", []) if item.strip()]
+        save_local = bool(data.get("saveLocal", True))
+        write_feishu = bool(data.get("writeFeishu", False))
+        feishu_doc = data.get("feishuDoc", "").strip()
+        feishu_folder = data.get("feishuFolder", "").strip()
+        feishu_title = data.get("feishuTitle", "抓取汇总").strip() or "抓取汇总"
 
         if not urls and not keyword:
             self._json({"ok": False, "error": "No URLs or keyword provided"}, HTTPStatus.BAD_REQUEST)
+            return
+        if not save_local and not write_feishu:
+            self._json({"ok": False, "error": "Please enable local export or Feishu writing."}, HTTPStatus.BAD_REQUEST)
+            return
+        if save_local and not formats:
+            self._json({"ok": False, "error": "At least one local format is required."}, HTTPStatus.BAD_REQUEST)
+            return
+        if write_feishu and not (feishu_doc or feishu_folder):
+            self._json({"ok": False, "error": "Feishu writing requires an existing doc or a target folder."}, HTTPStatus.BAD_REQUEST)
             return
 
         tmp = tempfile.NamedTemporaryFile("w", delete=False, suffix=".txt", encoding="utf-8", dir=UPLOAD_DIR)
@@ -554,13 +613,19 @@ class Handler(BaseHTTPRequestHandler):
                 tmp.name,
                 "--output",
                 output,
-                "--formats",
-                ",".join(formats),
             ]
+            if save_local:
+                cmd.extend(["--formats", ",".join(formats)])
             if keyword:
                 cmd.extend(["--keyword", keyword, "--keyword-limit", keyword_limit])
                 if keyword_sites:
                     cmd.extend(["--keyword-sites", ",".join(keyword_sites)])
+            if write_feishu and feishu_doc:
+                cmd.extend(["--feishu-doc", feishu_doc])
+            if write_feishu and feishu_folder:
+                cmd.extend(["--feishu-folder", feishu_folder])
+            if write_feishu and (feishu_doc or feishu_folder):
+                cmd.extend(["--feishu-title", feishu_title])
 
             job_id = create_job(cmd, output)
             threading.Thread(target=run_job, args=(job_id, cmd, output, tmp.name), daemon=True).start()

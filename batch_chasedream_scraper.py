@@ -26,9 +26,12 @@ FALLBACK_BROWSER_PROFILES = ["user", "my-chrome"]
 OPENCLAW_CONFIG = Path.home() / ".openclaw" / "openclaw.json"
 SERPAPI_KEY_FILE = Path.home() / ".serpapi_api_key"
 OPENCLAW_ROOT = Path(r"D:\openclaw")
+FEISHU_DOC_HELPER = OPENCLAW_ROOT / "爬取小蜥蜴" / "feishu_doc_helper.cjs"
 SEARCH_QUERIES = {
     "chasedream": [
         "site:chasedream.com/article",
+        "site:chasedream.com",
+        "site:forum.chasedream.com",
     ],
     "1point3acres": [
         "site:1point3acres.com/home/pins",
@@ -156,7 +159,7 @@ def extract_serpapi_result_urls(payload: object) -> list[str]:
 def serpapi_search_result_urls(query: str, api_key: str) -> list[str]:
     url = (
         "https://serpapi.com/search.json?"
-        f"engine=google&google_domain=google.com&hl=zh-cn&num=10&api_key={quote(api_key)}&q={quote(query)}"
+        f"engine=google&google_domain=google.com&hl=zh-cn&num=30&api_key={quote(api_key)}&q={quote(query)}"
     )
     return extract_serpapi_result_urls(fetch_json(url))
 
@@ -655,6 +658,29 @@ def expand_keyword_urls(keyword: str, sites: list[str], limit_per_site: int, bro
                     )
                 ]
             site_urls.extend(result_urls)
+        if site == "chasedream" and not site_urls:
+            broad_queries = [
+                keyword,
+                f"site:chasedream.com {keyword}",
+                f"site:chasedream.com/article {keyword}",
+            ]
+            for query in broad_queries:
+                try:
+                    result_urls = search_result_urls(query)
+                except Exception:
+                    result_urls = []
+                if not result_urls:
+                    try:
+                        result_urls = browser_search_result_urls(query, browser_profile)
+                    except Exception:
+                        result_urls = []
+                result_urls = [
+                    url for url in result_urls
+                    if re.search(r"https://www\.chasedream\.com/article/\d+", url)
+                ]
+                site_urls.extend(result_urls)
+                if site_urls:
+                    break
         site_urls = dedupe_keep_order(site_urls)
         log_line(f"[SEARCH-FOUND] {site} -> {len(site_urls)}")
         if site == "1point3acres" and not site_urls:
@@ -1403,6 +1429,37 @@ def trim_comment_message(lines: list[str]) -> list[str]:
     return cleaned
 
 
+ONEPOINT3ACRES_ARTICLE_NOISE = {
+    "来自APP",
+    "回复",
+    "分享",
+    "道具",
+    "匿名",
+    "最早",
+    "只看作者",
+    "楼主",
+}
+
+
+def is_onepoint3acres_article_noise(line: str) -> bool:
+    value = (line or "").strip()
+    if not value:
+        return True
+    if value in ONEPOINT3ACRES_ARTICLE_NOISE:
+        return True
+    if NUMERIC_RE.match(value):
+        return True
+    if is_time_line(value):
+        return True
+    if re.fullmatch(r"[·.。•]+", value):
+        return True
+    if re.fullmatch(r"(回复|分享|道具)\s*\d*", value):
+        return True
+    if re.fullmatch(r"(点赞|收藏|阅读|浏览)\s*\d+", value):
+        return True
+    return False
+
+
 def split_comment_block(text: str) -> list[dict]:
     lines = [line.strip() for line in text.replace("\r", "").splitlines() if line.strip()]
     comments: list[dict] = []
@@ -1508,15 +1565,15 @@ def parse_onepoint3acres_pin(payload: dict, url: str) -> dict:
         body_start = board_idx + 1
     else:
         body_start = title_idx + 1
-    while body_start < len(lines) and (
-        lines[body_start] in {"·", "回复", "分享", "道具", "匿名", "最早", "只看作者"}
-        or NUMERIC_RE.match(lines[body_start])
-        or is_time_line(lines[body_start])
-    ):
+    while body_start < len(lines) and is_onepoint3acres_article_noise(lines[body_start]):
         body_start += 1
 
     body_end = comments_line_idx if comments_line_idx is not None else len(lines)
-    article_lines = trim_comment_message(lines[body_start:body_end])
+    article_lines = [
+        line
+        for line in trim_comment_message(lines[body_start:body_end])
+        if not is_onepoint3acres_article_noise(line) and not line.startswith("\u5df2\u83b7\u5f97")
+    ]
     article_paragraphs: list[str] = []
     current: list[str] = []
     for line in article_lines:
@@ -1715,6 +1772,90 @@ def fallback_base_name(data: dict) -> str:
     return f"{slug_from_url(data['url'])}_{stamp}"
 
 
+def build_feishu_markdown(data: dict) -> str:
+    lines: list[str] = []
+    comments = data.get("comments", [])
+
+    lines.append(f"# {data.get('title', 'Untitled')}")
+    lines.append("")
+    lines.append(f"网址：{data.get('url', '')}")
+    lines.append("")
+    if data.get("author"):
+        lines.append(f"作者：{data.get('author', '')}")
+        lines.append("")
+    if data.get("date"):
+        lines.append(f"日期：{data.get('date', '')}")
+        lines.append("")
+    lines.append(f"评论数：{len(comments)}")
+    lines.append("")
+
+    lines.append("## 正文：")
+    lines.append("")
+    for part in data.get("article_paragraphs", []):
+        lines.append(str(part))
+        lines.append("")
+
+    lines.append("## 评论内容：")
+    lines.append("")
+    for index, comment in enumerate(comments, start=1):
+        lines.append(f"作者：{comment.get('username', '')}")
+        lines.append("")
+        lines.append(f"发布时间：{comment.get('time', '')}")
+        lines.append("")
+        lines.append(f"发布内容：{comment.get('message', '')}")
+        lines.append("")
+        if index < len(comments):
+            lines.append("------------------------------------")
+            lines.append("")
+
+    lines.append("===========================================")
+    lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+def write_to_feishu_doc(
+    data: dict,
+    *,
+    doc_token: str | None,
+    folder_token: str | None,
+    title: str | None,
+) -> dict:
+    if not FEISHU_DOC_HELPER.exists():
+        raise RuntimeError(f"Feishu helper not found: {FEISHU_DOC_HELPER}")
+    payload = {
+        "docToken": (doc_token or "").strip(),
+        "folderToken": (folder_token or "").strip(),
+        "title": (title or "").strip() or "抓取汇总",
+        "markdown": build_feishu_markdown(data),
+    }
+    proc = subprocess.run(
+        ["node", str(FEISHU_DOC_HELPER)],
+        input=json.dumps(payload, ensure_ascii=False),
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120000,
+        check=False,
+        cwd=str(OPENCLAW_ROOT / "爬取小蜥蜴"),
+    )
+    raw_stdout = (proc.stdout or "").strip()
+    raw_stderr = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        raise RuntimeError(raw_stderr or raw_stdout or "Feishu write failed")
+    raw = raw_stdout
+    if not raw:
+        raise RuntimeError(raw_stderr or "Feishu helper returned empty output.")
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"(\{.*\})\s*$", raw, flags=re.S)
+        if not match:
+            raise RuntimeError(raw_stderr or raw[:800])
+        result = json.loads(match.group(1))
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError(f"Unexpected Feishu helper result: {raw}")
+    return result
+
+
 def scrape_url(url: str, browser_profile: str) -> dict:
     host = urlparse(url).netloc.lower()
     if "chasedream.com" in host:
@@ -1809,7 +1950,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--formats",
-        default="html,json,pdf",
+        default="",
         help="Comma-separated output formats: html,json,docx,pdf",
     )
     parser.add_argument(
@@ -1829,6 +1970,9 @@ def main() -> int:
         default=300,
         help="How many seconds to sleep when the pause threshold is reached",
     )
+    parser.add_argument("--feishu-doc", help="Existing Feishu doc URL or doc token")
+    parser.add_argument("--feishu-folder", help="Target Feishu folder URL or folder token for auto-created doc")
+    parser.add_argument("--feishu-title", default="抓取汇总", help="Title when creating a new Feishu document")
     args = parser.parse_args()
 
     formats = {item.strip().lower() for item in args.formats.split(",") if item.strip()}
@@ -1836,6 +1980,9 @@ def main() -> int:
     unknown = formats - allowed
     if unknown:
         raise SystemExit(f"Unsupported formats: {', '.join(sorted(unknown))}")
+    use_feishu = bool((args.feishu_doc or "").strip() or (args.feishu_folder or "").strip())
+    if not formats and not use_feishu:
+        raise SystemExit("At least one local format or a Feishu destination is required.")
 
     input_path = Path(args.input)
     output_dir = Path(args.output)
@@ -1866,6 +2013,8 @@ def main() -> int:
         urls = dedupe_keep_order(urls + expanded_urls)
 
     results = []
+    feishu_doc_token = (args.feishu_doc or "").strip() or None
+    feishu_doc_url = None
     total = len(urls)
     log_line(f"[TOTAL-URLS] {total}")
     for index, url in enumerate(urls, start=1):
@@ -1878,7 +2027,30 @@ def main() -> int:
         log_line(f"[PROGRESS] {index}/{total} -> {url}")
         try:
             data = scrape_url(url, args.browser_profile)
-            result = export_result(data, output_dir, formats)
+            if formats:
+                result = export_result(data, output_dir, formats)
+            else:
+                result = {
+                    "url": data["url"],
+                    "title": data["title"],
+                    "site": data.get("site"),
+                    "json": None,
+                    "html": None,
+                    "docx": None,
+                    "pdf": None,
+                    "comments_count": len(data["comments"]),
+                }
+            if use_feishu:
+                feishu_res = write_to_feishu_doc(
+                    data,
+                    doc_token=feishu_doc_token,
+                    folder_token=args.feishu_folder,
+                    title=args.feishu_title,
+                )
+                feishu_doc_token = str(feishu_res.get("document_id", "")).strip() or feishu_doc_token
+                feishu_doc_url = feishu_res.get("url") or feishu_doc_url
+                result["feishu_doc"] = feishu_doc_url
+                log_line(f"[FEISHU] {feishu_doc_url}")
             results.append({"ok": True, **result})
             log_line(f"[OK] {url}")
             exported = [path for key, path in result.items() if key in {"json", "html", "docx", "pdf"} and path]
