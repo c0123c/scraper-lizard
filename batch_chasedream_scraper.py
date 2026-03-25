@@ -2,6 +2,7 @@ import argparse
 import base64
 import html
 import json
+import os
 import re
 import subprocess
 import sys
@@ -10,6 +11,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from datetime import datetime
 
 
 USER_AGENT = (
@@ -22,16 +24,80 @@ OPENCLAW_BROWSER_CLI = NPM_BIN / "clawdbot.cmd"
 DEFAULT_BROWSER_PROFILE = "user"
 FALLBACK_BROWSER_PROFILES = ["user", "my-chrome"]
 OPENCLAW_CONFIG = Path.home() / ".openclaw" / "openclaw.json"
-SEARCH_ENGINES = {
-    "chasedream": "site:chasedream.com/article",
-    "1point3acres": "site:1point3acres.com/home/pins",
+SERPAPI_KEY_FILE = Path.home() / ".serpapi_api_key"
+OPENCLAW_ROOT = Path(r"D:\openclaw")
+SEARCH_QUERIES = {
+    "chasedream": [
+        "site:chasedream.com/article",
+    ],
+    "1point3acres": [
+        "site:1point3acres.com/home/pins",
+        "site:1point3acres.com/bbs/thread-",
+        "site:1point3acres.com/bbs/forum.php?mod=viewthread",
+        "site:instant.1point3acres.cn/thread/",
+        "site:1point3acres.com",
+    ],
 }
+
+RESTRICTED_PATTERNS = [
+    r"仅限会员",
+    r"会员可见",
+    r"开通会员",
+    r"升级会员",
+    r"购买后查看",
+    r"付费可见",
+    r"付费内容",
+    r"VIP可见",
+    r"VIP专享",
+    r"权限不足",
+    r"无权查看",
+    r"需要登录后查看",
+    r"请先登录",
+]
+
+
+def log_line(message: str) -> None:
+    print(message, flush=True)
+
+
+def log_error(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def is_restricted_text(text: str) -> bool:
+    haystack = (text or "").replace("\r", "").strip()
+    if not haystack:
+        return False
+    return any(re.search(pattern, haystack, flags=re.I) for pattern in RESTRICTED_PATTERNS)
 
 
 def fetch_text(url: str) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Upgrade-Insecure-Requests": "1",
+        },
+    )
     with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+
+def fetch_json(url: str) -> object:
+    return json.loads(fetch_text(url))
+
+
+def load_serpapi_key() -> str:
+    env_key = os.environ.get("SERPAPI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    if SERPAPI_KEY_FILE.exists():
+        return SERPAPI_KEY_FILE.read_text(encoding="utf-8").strip()
+    return ""
 
 
 def dedupe_keep_order(items: list[str]) -> list[str]:
@@ -64,6 +130,468 @@ def extract_duckduckgo_result_urls(page_html: str) -> list[str]:
     return dedupe_keep_order(urls)
 
 
+def extract_bing_result_urls(page_html: str) -> list[str]:
+    urls: list[str] = []
+    matches = re.findall(r'<li class="b_algo".*?<a[^>]+href="([^"]+)"', page_html, flags=re.S | re.I)
+    for href in matches:
+        clean = html.unescape(href).strip()
+        if clean.startswith("http://") or clean.startswith("https://"):
+            urls.append(clean)
+    return dedupe_keep_order(urls)
+
+
+def extract_serpapi_result_urls(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    urls: list[str] = []
+    for item in payload.get("organic_results", []) or []:
+        if not isinstance(item, dict):
+            continue
+        link = str(item.get("link", "")).strip()
+        if link.startswith("http://") or link.startswith("https://"):
+            urls.append(link)
+    return dedupe_keep_order(urls)
+
+
+def serpapi_search_result_urls(query: str, api_key: str) -> list[str]:
+    url = (
+        "https://serpapi.com/search.json?"
+        f"engine=google&google_domain=google.com&hl=zh-cn&num=10&api_key={quote(api_key)}&q={quote(query)}"
+    )
+    return extract_serpapi_result_urls(fetch_json(url))
+
+
+def search_result_urls(query: str) -> list[str]:
+    serpapi_key = load_serpapi_key()
+    if serpapi_key:
+        try:
+            urls = serpapi_search_result_urls(query, serpapi_key)
+            if urls:
+                return urls
+        except Exception:
+            pass
+
+    providers = [
+        ("https://html.duckduckgo.com/html/?q=", extract_duckduckgo_result_urls),
+        ("https://www.bing.com/search?q=", extract_bing_result_urls),
+    ]
+    last_error = None
+    for base, parser in providers:
+        try:
+            page_html = fetch_text(base + quote(query))
+            urls = parser(page_html)
+            if urls:
+                return urls
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error:
+        raise last_error
+    return []
+
+
+def relay_tabs() -> list[dict]:
+    token = quote(load_gateway_token())
+    raw = fetch_text(f"http://127.0.0.1:18792/json/list?token={token}")
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise RuntimeError("Browser relay returned an unexpected tab list payload.")
+    return data
+
+
+def extract_onepoint3acres_urls_from_search_page(browser_profile: str, keyword: str) -> list[str]:
+    del browser_profile
+    tabs = relay_tabs()
+    keyword = keyword.strip().lower()
+    search_tabs = []
+    for tab in tabs:
+        url = str(tab.get("url", "")).strip()
+        title = str(tab.get("title", "")).strip()
+        haystack = f"{url} {title}".lower()
+        if not any(marker in haystack for marker in ("search", "srchtxt=", "duckduckgo.com", "bing.com", "google.com")):
+            continue
+        if keyword and keyword not in haystack and quote(keyword) not in haystack:
+            continue
+        search_tabs.append(tab)
+    if not search_tabs:
+        raise RuntimeError(
+            "Please open a search results page for this 1point3acres keyword in Chrome first, "
+            "keep that tab visible, and ensure the OpenClaw Browser Relay is ON."
+        )
+
+    target_id = str(search_tabs[-1].get("id") or search_tabs[-1].get("targetId") or "").strip()
+    if not target_id:
+        raise RuntimeError("Could not determine the target id for the current search results tab.")
+
+    result = cdp_evaluate_target(
+        target_id,
+        """
+JSON.stringify(
+  Array.from(document.querySelectorAll('a[href]'))
+    .map((a) => a.href)
+    .filter(Boolean)
+)
+""".strip(),
+        timeout=50000,
+    )
+    if isinstance(result, str):
+        result = json.loads(result)
+    if not isinstance(result, list):
+        raise RuntimeError("Could not read links from the current search results page.")
+
+    urls = [
+        str(item).strip()
+        for item in result
+        if re.search(
+            r"https://www\.1point3acres\.com/home/pins/\d+"
+            r"|https://www\.1point3acres\.com/bbs/thread-\d+-\d+-\d+\.html"
+            r"|https://www\.1point3acres\.com/bbs/forum\.php\?mod=viewthread&tid=\d+"
+            r"|https://instant\.1point3acres\.cn/thread/\d+",
+            str(item),
+        )
+    ]
+    return dedupe_keep_order(urls)
+
+
+def extract_onepoint3acres_post_urls(result: object) -> list[str]:
+    if isinstance(result, str):
+        result = json.loads(result)
+    if not isinstance(result, list):
+        return []
+    urls = [
+        str(item).strip()
+        for item in result
+        if re.search(
+            r"https://www\.1point3acres\.com/home/pins/\d+"
+            r"|https://www\.1point3acres\.com/bbs/thread-\d+-\d+-\d+\.html"
+            r"|https://www\.1point3acres\.com/bbs/forum\.php\?mod=viewthread&tid=\d+"
+            r"|https://instant\.1point3acres\.cn/thread/\d+",
+            str(item),
+        )
+    ]
+    return dedupe_keep_order(urls)
+
+
+def scroll_and_collect_onepoint3acres_search_urls(target_id: str, rounds: int = 8) -> list[str]:
+    seen_urls: list[str] = []
+    stagnant_rounds = 0
+    for _ in range(rounds):
+        result = cdp_evaluate_target(
+            target_id,
+            """
+JSON.stringify(
+  Array.from(document.querySelectorAll('a[href]'))
+    .map((a) => a.href)
+    .filter(Boolean)
+)
+""".strip(),
+            timeout=50000,
+        )
+        urls = extract_onepoint3acres_post_urls(result)
+        merged = dedupe_keep_order(seen_urls + urls)
+        if len(merged) == len(seen_urls):
+            stagnant_rounds += 1
+        else:
+            stagnant_rounds = 0
+        seen_urls = merged
+        if stagnant_rounds >= 2:
+            break
+
+        action = cdp_evaluate_target(
+            target_id,
+            """
+JSON.stringify((() => {
+  const textOf = (el) => ((el.innerText || el.textContent || '').trim());
+  const clickables = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+  const nextLike = clickables.find((el) => {
+    const text = textOf(el);
+    if (!text) return false;
+    return /下一页|下页|更多|加载更多|查看更多|Show more|Load more|Next/i.test(text);
+  });
+  if (nextLike) {
+    nextLike.click();
+    return { action: 'clicked', text: textOf(nextLike) };
+  }
+  const before = window.scrollY;
+  window.scrollTo({ top: document.body.scrollHeight, behavior: 'instant' });
+  return {
+    action: 'scrolled',
+    before,
+    after: window.scrollY,
+    height: document.body.scrollHeight
+  };
+})())
+""".strip(),
+            timeout=50000,
+        )
+        del action
+        time.sleep(1.2)
+    return seen_urls
+
+
+def collect_onepoint3acres_search_state(target_id: str) -> dict:
+    result = cdp_evaluate_target(
+        target_id,
+        """
+JSON.stringify((() => {
+  const normalize = (value) => (value || '').trim();
+  const anchors = Array.from(document.querySelectorAll('a[href]'));
+  const pinItems = anchors
+    .map((a) => ({
+      href: normalize(a.href),
+      text: normalize(a.innerText || a.textContent || a.getAttribute('title') || ''),
+      containerText: normalize((a.closest('li, article, section, div')?.innerText) || '')
+    }))
+    .filter((item) => /^https:\/\/www\.1point3acres\.com\/home\/pins\/\d+$/i.test(item.href))
+    .filter((item) => item.text || item.containerText);
+  const nextCandidates = anchors
+    .map((a) => ({
+      href: normalize(a.href),
+      text: normalize(a.innerText || a.textContent || a.getAttribute('aria-label') || ''),
+      rel: normalize(a.getAttribute('rel') || '')
+    }))
+    .filter((item) => item.href)
+    .filter((item) => item.rel.toLowerCase() === 'next' || /^(下一页|下页|Next)$/i.test(item.text));
+  return {
+    pageUrl: location.href,
+    items: pinItems,
+    nextCandidates
+  };
+})())
+""".strip(),
+        timeout=50000,
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("Could not read the 1point3acres search state.")
+    return result
+
+
+def filter_onepoint3acres_search_items(items: object, keyword: str) -> list[str]:
+    if isinstance(items, str):
+        items = json.loads(items)
+    if not isinstance(items, list):
+        return []
+    normalized_keyword = keyword.strip().lower()
+    urls: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        href = str(item.get("href", "")).strip()
+        text = str(item.get("text", "")).strip()
+        container_text = str(item.get("containerText", "")).strip()
+        if not href:
+            continue
+        haystack = f"{text}\n{container_text}".lower()
+        if normalized_keyword and normalized_keyword not in haystack:
+            continue
+        urls.append(href)
+    return dedupe_keep_order(urls)
+
+
+def next_search_page_href(page_url: str, next_candidates: list[dict], visited_pages: set[str]) -> str | None:
+    for item in next_candidates:
+        href = str(item.get("href", "")).strip()
+        if not href or href == page_url or href in visited_pages:
+            continue
+        if "1point3acres.com/home/search" not in href:
+            continue
+        if re.search(r"[?&](?:page|p|offset|cursor)=", href):
+            return href
+    for item in next_candidates:
+        href = str(item.get("href", "")).strip()
+        if not href or href == page_url or href in visited_pages:
+            continue
+        if "1point3acres.com/home/search" in href:
+            return href
+    return None
+
+
+def scroll_and_collect_onepoint3acres_search_urls_v2(target_id: str, keyword: str, rounds: int = 12) -> list[str]:
+    seen_urls: list[str] = []
+    visited_pages: set[str] = set()
+    stagnant_rounds = 0
+    for round_index in range(1, rounds + 1):
+        state = collect_onepoint3acres_search_state(target_id)
+        page_url = str(state.get("pageUrl", "")).strip()
+        if page_url and "/home/search" not in page_url:
+            log_line(f"[SEARCH-STOP] left search page -> {page_url}")
+            break
+        if page_url:
+            visited_pages.add(page_url)
+        urls = filter_onepoint3acres_search_items(state.get("items", []), keyword)
+        merged = dedupe_keep_order(seen_urls + urls)
+        log_line(f"[SEARCH-PAGE] round={round_index} page={page_url or 'unknown'} links={len(urls)} total={len(merged)}")
+        if len(merged) == len(seen_urls):
+            stagnant_rounds += 1
+        else:
+            stagnant_rounds = 0
+        seen_urls = merged
+
+        next_href = next_search_page_href(page_url, list(state.get("nextCandidates", []) or []), visited_pages)
+        if next_href:
+            log_line(f"[SEARCH-NEXT] {next_href}")
+            cdp_evaluate_target(
+                target_id,
+                f"JSON.stringify((location.href = {json.dumps(next_href)}, {{ action: 'navigate', href: location.href }}))",
+                timeout=50000,
+            )
+            time.sleep(2.0)
+            continue
+
+        if stagnant_rounds >= 2:
+            log_line("[SEARCH-DONE] search results stabilized")
+            break
+
+        action = cdp_evaluate_target(
+            target_id,
+            """
+JSON.stringify((() => {
+  window.scrollTo({ top: document.body.scrollHeight, behavior: 'instant' });
+  return { action: 'scrolled' };
+})())
+""".strip(),
+            timeout=50000,
+        )
+        if isinstance(action, dict):
+            log_line(f"[SEARCH-ACTION] {json.dumps(action, ensure_ascii=False)}")
+        time.sleep(1.2)
+    return seen_urls
+
+
+def search_onepoint3acres_site_urls(keyword: str, browser_profile: str) -> list[str]:
+    search_url = "https://www.1point3acres.com/home/search?q=" + quote(keyword)
+    profiles_to_try: list[str] = []
+    for name in [browser_profile, *FALLBACK_BROWSER_PROFILES]:
+        if name and name not in profiles_to_try:
+            profiles_to_try.append(name)
+
+    # Prefer a fully automatic CDP-opened search tab so keyword mode does not
+    # depend on the user manually opening the search page first.
+    target_id = None
+    try:
+        log_line(f"[SEARCH-AUTO] opening {search_url}")
+        target_id = cdp_create_target(search_url, timeout=50000)
+        cdp_wait_document_ready(target_id, timeout_ms=25000)
+        time.sleep(2.0)
+        urls = scroll_and_collect_onepoint3acres_search_urls_v2(target_id, keyword)
+        if urls:
+            log_line(f"[SEARCH-COLLECTED] {len(urls)}")
+            return urls
+    except Exception as exc:
+        log_error(f"[SEARCH-AUTO-ERROR] {exc}")
+    finally:
+        if target_id:
+            try:
+                cdp_close_target(target_id)
+            except Exception:
+                pass
+
+    last_error = None
+    for profile_name in profiles_to_try:
+        target_id = None
+        opened_new = False
+        try:
+            log_line(f"[SEARCH-OPEN] profile={profile_name} keyword={keyword}")
+            target_id = try_select_matching_tab(profile_name, search_url, allow_host_fallback=False)
+            if not target_id:
+                target_id = try_select_host_tab(profile_name, "1point3acres.com")
+                if target_id:
+                    cdp_navigate_target(target_id, search_url)
+                    log_line(f"[SEARCH-TAB] reused-host target={target_id}")
+                else:
+                    target_id = browser_open(search_url, profile_name)
+                    opened_new = True
+                    log_line(f"[SEARCH-TAB] opened target={target_id}")
+            else:
+                log_line(f"[SEARCH-TAB] reused target={target_id}")
+            browser_focus(profile_name, target_id)
+            for wait_ms in (2500, 4500, 7000):
+                log_line(f"[SEARCH-WAIT] target={target_id} wait_ms={wait_ms}")
+                browser_wait(profile_name, wait_ms, target_id)
+                urls = scroll_and_collect_onepoint3acres_search_urls_v2(target_id, keyword)
+                if urls:
+                    log_line(f"[SEARCH-COLLECTED] {len(urls)}")
+                    return urls
+        except Exception as exc:
+            last_error = exc
+            log_error(f"[SEARCH-ERROR] profile={profile_name} -> {exc}")
+            continue
+        finally:
+            if opened_new and target_id:
+                try:
+                    cdp_close_target(target_id)
+                except Exception:
+                    pass
+
+    if last_error:
+        raise RuntimeError(f"1point3acres site search failed: {last_error}")
+    return []
+
+
+def browser_search_result_urls(query: str, browser_profile: str) -> list[str]:
+    search_url = "https://www.bing.com/search?q=" + quote(query)
+    target_id = None
+    try:
+        target_id = cdp_create_target(search_url, timeout=50000)
+        time.sleep(3.0)
+        result = cdp_evaluate_target(
+            target_id,
+            """
+JSON.stringify(
+  Array.from(document.querySelectorAll('a[href]'))
+    .map((a) => a.href)
+    .filter((href) => href && /^https?:\\/\\//.test(href))
+)
+""".strip(),
+            timeout=50000,
+        )
+        if isinstance(result, list):
+            return dedupe_keep_order([str(item).strip() for item in result if str(item).strip()])
+        if isinstance(result, str):
+            return dedupe_keep_order(json.loads(result))
+    except Exception:
+        pass
+    finally:
+        if target_id:
+            try:
+                cdp_close_target(target_id)
+            except Exception:
+                pass
+
+    profiles_to_try: list[str] = []
+    for name in [browser_profile, *FALLBACK_BROWSER_PROFILES]:
+        if name and name not in profiles_to_try:
+            profiles_to_try.append(name)
+
+    last_error = None
+    for profile_name in profiles_to_try:
+        try:
+            target_id = browser_open(search_url, profile_name)
+            browser_wait(profile_name, 2200, target_id)
+            result = cdp_evaluate_target(
+                target_id,
+                """
+JSON.stringify(
+  Array.from(document.querySelectorAll('a[href]'))
+    .map((a) => a.href)
+    .filter((href) => href && /^https?:\\/\\//.test(href))
+)
+""".strip(),
+                timeout=50000,
+            )
+            if isinstance(result, list):
+                return dedupe_keep_order([str(item).strip() for item in result if str(item).strip()])
+            if isinstance(result, str):
+                return dedupe_keep_order(json.loads(result))
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if last_error:
+        raise RuntimeError(f"Browser keyword search failed: {last_error}")
+    return []
+
+
 def normalize_keyword_sites(raw_sites: list[str] | None) -> list[str]:
     if not raw_sites:
         return ["chasedream", "1point3acres"]
@@ -84,20 +612,51 @@ def normalize_keyword_sites(raw_sites: list[str] | None) -> list[str]:
     return normalized
 
 
-def expand_keyword_urls(keyword: str, sites: list[str], limit_per_site: int) -> list[str]:
+def expand_keyword_urls(keyword: str, sites: list[str], limit_per_site: int, browser_profile: str) -> list[str]:
     keyword = keyword.strip()
     if not keyword:
         raise RuntimeError("Keyword mode requires a non-empty keyword.")
     all_urls: list[str] = []
     for site in normalize_keyword_sites(sites):
-        query = f"{SEARCH_ENGINES[site]} {keyword}"
-        search_url = "https://html.duckduckgo.com/html/?q=" + quote(query)
-        result_urls = extract_duckduckgo_result_urls(fetch_text(search_url))
-        if site == "chasedream":
-            result_urls = [url for url in result_urls if re.search(r"https://www\.chasedream\.com/article/\d+", url)]
-        elif site == "1point3acres":
-            result_urls = [url for url in result_urls if re.search(r"https://www\.1point3acres\.com/home/pins/\d+", url)]
-        all_urls.extend(result_urls[:limit_per_site])
+        log_line(f"[SEARCH] {site} -> {keyword}")
+        site_urls: list[str] = []
+        if site == "1point3acres":
+            try:
+                site_urls.extend(search_onepoint3acres_site_urls(keyword, browser_profile))
+            except Exception:
+                site_urls = []
+        for base_query in SEARCH_QUERIES[site]:
+            if site == "1point3acres" and site_urls:
+                break
+            query = f"{base_query} {keyword}"
+            try:
+                result_urls = search_result_urls(query)
+            except Exception:
+                result_urls = []
+            if site == "chasedream":
+                result_urls = [
+                    url for url in result_urls
+                    if re.search(r"https://www\.chasedream\.com/article/\d+", url)
+                ]
+            elif site == "1point3acres":
+                result_urls = [
+                    url for url in result_urls
+                    if re.search(
+                        r"https://www\.1point3acres\.com/home/pins/\d+"
+                        r"|https://www\.1point3acres\.com/bbs/thread-\d+-\d+-\d+\.html"
+                        r"|https://www\.1point3acres\.com/bbs/forum\.php\?mod=viewthread&tid=\d+"
+                        r"|https://instant\.1point3acres\.cn/thread/\d+",
+                        url,
+                    )
+                ]
+            site_urls.extend(result_urls)
+        site_urls = dedupe_keep_order(site_urls)
+        log_line(f"[SEARCH-FOUND] {site} -> {len(site_urls)}")
+        if site == "1point3acres" and not site_urls:
+            site_urls.extend(extract_onepoint3acres_urls_from_search_page(browser_profile, keyword))
+            site_urls = dedupe_keep_order(site_urls)
+            log_line(f"[SEARCH-FALLBACK] {site} -> {len(site_urls)}")
+        all_urls.extend(dedupe_keep_order(site_urls)[:limit_per_site])
     return dedupe_keep_order(all_urls)
 
 
@@ -292,19 +851,27 @@ $doc.Close()
 $word.Quit()
 """
     try:
-        subprocess.run(
+        proc = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
-            check=True,
+            check=False,
             capture_output=True,
             encoding="utf-8",
             errors="replace",
         )
-    except Exception:
-        return {"docx": False, "pdf": False}
-    return {
+    except Exception as exc:
+        return {"docx": False, "pdf": False, "error": str(exc)}
+
+    flags = {
         "docx": bool(docx_path and docx_path.exists()),
         "pdf": bool(pdf_path and pdf_path.exists()),
     }
+    if proc.returncode != 0 and not flags["docx"] and not flags["pdf"]:
+        details = (proc.stderr or proc.stdout or "").strip()
+        return {
+            **flags,
+            "error": details or f"Word export exited with code {proc.returncode}",
+        }
+    return flags
 
 
 def extract_chasedream_article(page_html: str, url: str) -> dict:
@@ -377,6 +944,7 @@ def run_node_script(script: str, timeout: int = 40000) -> str:
         errors="replace",
         timeout=timeout,
         check=False,
+        cwd=str(OPENCLAW_ROOT),
     )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "node helper failed").strip()
@@ -433,6 +1001,141 @@ ws.onopen = async () => {{
     if not raw:
         raise RuntimeError("CDP evaluate returned empty output.")
     return json.loads(raw)
+
+
+def cdp_create_target(url: str, timeout: int = 40000) -> str:
+    relay_token = load_gateway_token()
+    script = f"""
+const ws = new WebSocket('ws://127.0.0.1:18792/cdp?token={relay_token}');
+let seq = 0;
+const pending = new Map();
+function send(method, params) {{
+  const id = ++seq;
+  ws.send(JSON.stringify({{ id, method, params }}));
+  return new Promise((resolve, reject) => pending.set(id, {{ resolve, reject }}));
+}}
+ws.onmessage = (ev) => {{
+  const msg = JSON.parse(ev.data);
+  if (!msg.id || !pending.has(msg.id)) return;
+  const p = pending.get(msg.id);
+  pending.delete(msg.id);
+  if (msg.error) p.reject(new Error(typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)));
+  else p.resolve(msg.result);
+}};
+ws.onerror = () => {{
+  console.error('WebSocket relay error');
+  process.exit(1);
+}};
+ws.onopen = async () => {{
+  try {{
+    const result = await send('Target.createTarget', {{ url: {json.dumps(url)} }});
+    process.stdout.write(result.targetId || '');
+  }} catch (err) {{
+    console.error(String(err));
+    process.exitCode = 1;
+  }} finally {{
+    setTimeout(() => ws.close(), 100);
+  }}
+}};
+"""
+    target_id = run_node_script(script, timeout=timeout).strip()
+    if not target_id:
+        raise RuntimeError("CDP createTarget returned empty targetId.")
+    return target_id
+
+
+def cdp_close_target(target_id: str, timeout: int = 20000) -> None:
+    relay_token = load_gateway_token()
+    script = f"""
+const ws = new WebSocket('ws://127.0.0.1:18792/cdp?token={relay_token}');
+let seq = 0;
+const pending = new Map();
+function send(method, params) {{
+  const id = ++seq;
+  ws.send(JSON.stringify({{ id, method, params }}));
+  return new Promise((resolve, reject) => pending.set(id, {{ resolve, reject }}));
+}}
+ws.onmessage = (ev) => {{
+  const msg = JSON.parse(ev.data);
+  if (!msg.id || !pending.has(msg.id)) return;
+  const p = pending.get(msg.id);
+  pending.delete(msg.id);
+  if (msg.error) p.reject(new Error(typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)));
+  else p.resolve(msg.result);
+}};
+ws.onerror = () => process.exit(1);
+ws.onopen = async () => {{
+  try {{
+    await send('Target.closeTarget', {{ targetId: {json.dumps(target_id)} }});
+  }} catch (err) {{
+  }} finally {{
+    setTimeout(() => ws.close(), 100);
+  }}
+}};
+"""
+    try:
+        run_node_script(script, timeout=timeout)
+    except RuntimeError:
+        pass
+
+
+def cdp_navigate_target(target_id: str, url: str, timeout: int = 40000) -> None:
+    relay_token = load_gateway_token()
+    script = f"""
+const ws = new WebSocket('ws://127.0.0.1:18792/cdp?token={relay_token}');
+let seq = 0;
+const pending = new Map();
+function send(method, params, sessionId) {{
+  const id = ++seq;
+  const payload = {{ id, method, params }};
+  if (sessionId) payload.sessionId = sessionId;
+  ws.send(JSON.stringify(payload));
+  return new Promise((resolve, reject) => pending.set(id, {{ resolve, reject }}));
+}}
+ws.onmessage = (ev) => {{
+  const msg = JSON.parse(ev.data);
+  if (!msg.id || !pending.has(msg.id)) return;
+  const p = pending.get(msg.id);
+  pending.delete(msg.id);
+  if (msg.error) p.reject(new Error(typeof msg.error === 'string' ? msg.error : JSON.stringify(msg.error)));
+  else p.resolve(msg.result);
+}};
+ws.onerror = () => process.exit(1);
+ws.onopen = async () => {{
+  try {{
+    const attached = await send('Target.attachToTarget', {{ targetId: {json.dumps(target_id)}, flatten: true }});
+    const sessionId = attached.sessionId;
+    await send('Page.enable', {{}}, sessionId);
+    await send('Page.navigate', {{ url: {json.dumps(url)} }}, sessionId);
+  }} catch (err) {{
+    console.error(String(err));
+    process.exitCode = 1;
+  }} finally {{
+    setTimeout(() => ws.close(), 100);
+  }}
+}};
+"""
+    run_node_script(script, timeout=timeout)
+
+
+def cdp_wait_document_ready(target_id: str, timeout_ms: int = 20000) -> None:
+    deadline = time.time() + (timeout_ms / 1000.0)
+    last_state = ""
+    while time.time() < deadline:
+        try:
+            state = cdp_evaluate_target(
+                target_id,
+                "JSON.stringify(document.readyState)",
+                timeout=12000,
+            )
+            if isinstance(state, str):
+                last_state = state
+                if state in {"interactive", "complete"}:
+                    return
+        except Exception:
+            pass
+        time.sleep(0.6)
+    raise RuntimeError(f"Timed out waiting for document ready state. Last state: {last_state or 'unknown'}")
 
 
 def run_browser_command(args: list[str], timeout: int = 30000) -> str:
@@ -513,7 +1216,28 @@ def browser_snapshot_text(profile: str, target_id: str) -> str:
     )
 
 
-def select_matching_tab(profile: str, url: str) -> str:
+def try_select_matching_tab(profile: str, url: str, *, allow_host_fallback: bool = False) -> str | None:
+    try:
+        return select_matching_tab(profile, url, allow_host_fallback=allow_host_fallback)
+    except RuntimeError:
+        return None
+
+
+def try_select_host_tab(profile: str, host: str) -> str | None:
+    try:
+        tabs = browser_tabs(profile)
+    except RuntimeError:
+        return None
+    host = host.lower().strip()
+    if not host:
+        return None
+    host_matches = [tab for tab in tabs if host in tab.get("url", "").lower()]
+    if host_matches:
+        return host_matches[-1]["targetId"]
+    return None
+
+
+def select_matching_tab(profile: str, url: str, *, allow_host_fallback: bool = True) -> str:
     tabs = browser_tabs(profile)
     exact_matches = [tab for tab in tabs if tab.get("url", "") == url]
     if exact_matches:
@@ -528,6 +1252,8 @@ def select_matching_tab(profile: str, url: str) -> str:
         thread_matches = [tab for tab in tabs if thread_id in tab.get("url", "")]
         if thread_matches:
             return thread_matches[-1]["targetId"]
+    if not allow_host_fallback:
+        raise RuntimeError(f"Could not find an exact browser tab for {url}")
     host = urlparse(url).netloc.lower()
     host_matches = [tab for tab in tabs if host in tab.get("url", "").lower()]
     if host_matches:
@@ -732,6 +1458,12 @@ def parse_onepoint3acres_pin(payload: dict, url: str) -> dict:
     main_text = str(payload.get("mainText", "")).replace("\r", "").strip()
     if not main_text:
         raise RuntimeError("1point3acres pin page did not expose readable text.")
+    if is_restricted_text("\n".join([
+        str(payload.get("title", "")),
+        str(payload.get("pageTitle", "")),
+        str(payload.get("mainText", "")),
+    ])):
+        raise RuntimeError("Skipped restricted/member-only page.")
 
     lines = [line.strip() for line in main_text.splitlines() if line.strip()]
     title = str(payload.get("title", "")).strip() or str(payload.get("pageTitle", "")).strip()
@@ -827,26 +1559,100 @@ def scrape_onepoint3acres(url: str, browser_profile: str) -> dict:
             profiles_to_try.append(name)
 
     parsed = urlparse(url)
+    is_pin_url = "/home/pins/" in parsed.path
+
+    if is_pin_url:
+        target_id = None
+        try:
+            log_line(f"[PIN-AUTO] opening {url}")
+            target_id = cdp_create_target(url, timeout=50000)
+            cdp_wait_document_ready(target_id, timeout_ms=25000)
+            pin_error = None
+            for wait_ms in (2500, 4500, 7000):
+                log_line(f"[PIN-WAIT] target={target_id} wait_ms={wait_ms}")
+                time.sleep(wait_ms / 1000.0)
+                try:
+                    payload = fetch_onepoint3acres_pin_payload(target_id)
+                    return parse_onepoint3acres_pin(payload, url)
+                except RuntimeError as exc:
+                    pin_error = exc
+                    continue
+            if pin_error:
+                raise pin_error
+        except Exception as exc:
+            log_error(f"[PIN-AUTO-ERROR] {exc}")
+        finally:
+            if target_id:
+                try:
+                    cdp_close_target(target_id)
+                except Exception:
+                    pass
+
     last_error = None
     for profile_name in profiles_to_try:
+        target_id = None
+        opened_new = False
         try:
-            target_id = None
-            try:
-                target_id = select_matching_tab(profile_name, url)
-            except RuntimeError:
-                if "/home/pins/" in parsed.path:
-                    target_id = browser_open(url, profile_name)
+            if is_pin_url:
+                target_id = try_select_matching_tab(profile_name, url, allow_host_fallback=False)
+                if not target_id:
+                    target_id = try_select_host_tab(profile_name, "1point3acres.com")
+                    if target_id:
+                        cdp_navigate_target(target_id, url)
+                        log_line(f"[PIN-TAB] reused-host target={target_id}")
+                    else:
+                        target_id = browser_open(url, profile_name)
+                        opened_new = True
+                        log_line(f"[PIN-TAB] opened target={target_id}")
+                else:
+                    log_line(f"[PIN-TAB] reused target={target_id}")
+            else:
+                try:
+                    target_id = select_matching_tab(
+                        profile_name,
+                        url,
+                        allow_host_fallback=True,
+                    )
+                    log_line(f"[THREAD-TAB] reused target={target_id}")
+                except RuntimeError:
+                    target_id = try_select_host_tab(profile_name, "1point3acres.com")
+                    if target_id:
+                        cdp_navigate_target(target_id, url)
+                        log_line(f"[THREAD-TAB] reused-host target={target_id}")
+                    else:
+                        target_id = browser_open(url, profile_name)
+                        opened_new = True
+                        log_line(f"[THREAD-TAB] opened target={target_id}")
             if not target_id:
                 raise RuntimeError(f"Could not find or open a browser tab for {url}")
             browser_focus(profile_name, target_id)
-            browser_wait(profile_name, 1800, target_id)
-            if "/home/pins/" in parsed.path:
-                return parse_onepoint3acres_pin(fetch_onepoint3acres_pin_payload(target_id), url)
+            if is_pin_url:
+                pin_error = None
+                for wait_ms in (2500, 4500, 7000):
+                    browser_wait(profile_name, wait_ms, target_id)
+                    try:
+                        return parse_onepoint3acres_pin(
+                            fetch_onepoint3acres_pin_payload(target_id),
+                            url,
+                        )
+                    except RuntimeError as exc:
+                        pin_error = exc
+                        continue
+                if pin_error:
+                    raise pin_error
+                raise RuntimeError(f"Could not parse 1point3acres pin page for {url}")
+            browser_wait(profile_name, 2500, target_id)
             snapshot_text = browser_snapshot_text(profile_name, target_id)
             return parse_onepoint3acres_snapshot(snapshot_text, url)
         except RuntimeError as exc:
             last_error = exc
             continue
+        finally:
+            if opened_new and target_id:
+                try:
+                    cdp_close_target(target_id)
+                except Exception:
+                    pass
 
     raise RuntimeError(
         "Please open this exact 1point3acres thread in Chrome first, finish any Cloudflare/remote-debugging prompts, "
@@ -871,10 +1677,46 @@ def slug_from_url(url: str) -> str:
     return f"{host_slug}_page"
 
 
+def sanitize_filename(value: str) -> str:
+    value = (value or "").strip()
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", value)
+    value = re.sub(r"\s+", " ", value).strip().rstrip(". ")
+    value = re.sub(r"[。．｡！？!？、，,；;：:…·~]+$", "", value).strip().rstrip(". ")
+    return value[:120] if value else ""
+
+
+def pick_base_name(data: dict) -> str:
+    title_name = sanitize_filename(str(data.get("title", "")))
+    return title_name or f"{slug_from_url(data['url'])}_article_comments"
+
+
+def unique_base_name(output_dir: Path, base_name: str, suffixes: list[str]) -> str:
+    def available(candidate_base: str) -> bool:
+        return not any((output_dir / f"{candidate_base}{suffix}").exists() for suffix in suffixes)
+
+    if available(base_name):
+        return base_name
+
+    index = 2
+    while True:
+        candidate = f"{base_name}_{index}"
+        if available(candidate):
+            return candidate
+        index += 1
+
+
+def fallback_base_name(data: dict) -> str:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{slug_from_url(data['url'])}_{stamp}"
+
+
 def scrape_url(url: str, browser_profile: str) -> dict:
     host = urlparse(url).netloc.lower()
     if "chasedream.com" in host:
-        article = extract_chasedream_article(fetch_text(url), url)
+        page_html = fetch_text(url)
+        if is_restricted_text(page_html):
+            raise RuntimeError("Skipped restricted/member-only page.")
+        article = extract_chasedream_article(page_html, url)
         total_pages = int(article["comments_pagination"].get("total", 1) or 1)
         article["comments"] = fetch_chasedream_comments(article["article_id"], total_pages)
         return article
@@ -884,16 +1726,34 @@ def scrape_url(url: str, browser_profile: str) -> dict:
 
 
 def export_result(data: dict, output_dir: Path, formats: set[str]) -> dict:
-    base_name = f"{slug_from_url(data['url'])}_article_comments"
+    requested_suffixes = [f".{fmt}" for fmt in sorted(formats)]
+    base_name = unique_base_name(output_dir, pick_base_name(data), requested_suffixes)
+    alt_base_name = unique_base_name(output_dir, fallback_base_name(data), requested_suffixes)
     json_path = output_dir / f"{base_name}.json"
     html_path = output_dir / f"{base_name}.html"
     docx_path = output_dir / f"{base_name}.docx"
     pdf_path = output_dir / f"{base_name}.pdf"
 
+    def use_alt_paths() -> tuple[Path, Path, Path, Path]:
+        return (
+            output_dir / f"{alt_base_name}.json",
+            output_dir / f"{alt_base_name}.html",
+            output_dir / f"{alt_base_name}.docx",
+            output_dir / f"{alt_base_name}.pdf",
+        )
+
     if "json" in formats:
-        json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except PermissionError:
+            json_path, html_path, docx_path, pdf_path = use_alt_paths()
+            json_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     if "html" in formats or "docx" in formats or "pdf" in formats:
-        html_path.write_text(build_html_doc(data), encoding="utf-8")
+        try:
+            html_path.write_text(build_html_doc(data), encoding="utf-8")
+        except PermissionError:
+            json_path, html_path, docx_path, pdf_path = use_alt_paths()
+            html_path.write_text(build_html_doc(data), encoding="utf-8")
 
     export_flags = {"docx": False, "pdf": False}
     if "docx" in formats or "pdf" in formats:
@@ -902,6 +1762,14 @@ def export_result(data: dict, output_dir: Path, formats: set[str]) -> dict:
             docx_path if "docx" in formats else None,
             pdf_path if "pdf" in formats else None,
         )
+        missing_formats = []
+        if "docx" in formats and not export_flags.get("docx"):
+            missing_formats.append("docx")
+        if "pdf" in formats and not export_flags.get("pdf"):
+            missing_formats.append("pdf")
+        if missing_formats:
+            reason = export_flags.get("error") or "Requested output file was not generated."
+            raise RuntimeError(f"Failed to export {', '.join(missing_formats)}: {reason}")
 
     if "html" not in formats and html_path.exists():
         html_path.unlink()
@@ -944,6 +1812,18 @@ def main() -> int:
         default=DEFAULT_BROWSER_PROFILE,
         help="OpenClaw browser profile for sites that require browser extraction",
     )
+    parser.add_argument(
+        "--pause-every",
+        type=int,
+        default=100,
+        help="Pause after this many processed URLs; 0 disables pausing",
+    )
+    parser.add_argument(
+        "--pause-seconds",
+        type=int,
+        default=300,
+        help="How many seconds to sleep when the pause threshold is reached",
+    )
     args = parser.parse_args()
 
     formats = {item.strip().lower() for item in args.formats.split(",") if item.strip()}
@@ -963,21 +1843,42 @@ def main() -> int:
     ]
     if args.keyword:
         keyword_sites = [item.strip() for item in args.keyword_sites.split(",") if item.strip()]
-        expanded_urls = expand_keyword_urls(args.keyword, keyword_sites, max(args.keyword_limit, 1))
-        print(f"[KEYWORD] {args.keyword}")
-        print(f"[KEYWORD-SITES] {', '.join(normalize_keyword_sites(keyword_sites))}")
-        print(f"[KEYWORD-EXPANDED] {len(expanded_urls)}")
+        expanded_urls = expand_keyword_urls(
+            args.keyword,
+            keyword_sites,
+            max(args.keyword_limit, 1),
+            args.browser_profile,
+        )
+        log_line(f"[KEYWORD] {args.keyword}")
+        log_line(f"[KEYWORD-SITES] {', '.join(normalize_keyword_sites(keyword_sites))}")
+        log_line(f"[KEYWORD-EXPANDED] {len(expanded_urls)}")
         for item in expanded_urls:
-            print(f"[URL] {item}")
+            log_line(f"[URL] {item}")
+        if not expanded_urls:
+            raise RuntimeError(
+                f"No posts were found for keyword '{args.keyword}' in {', '.join(normalize_keyword_sites(keyword_sites))}."
+            )
         urls = dedupe_keep_order(urls + expanded_urls)
 
     results = []
-    for url in urls:
+    total = len(urls)
+    log_line(f"[TOTAL-URLS] {total}")
+    for index, url in enumerate(urls, start=1):
+        if args.pause_every > 0 and index > 1 and (index - 1) % args.pause_every == 0:
+            log_line(
+                f"[PAUSE] processed={index - 1} sleeping={args.pause_seconds}s"
+            )
+            time.sleep(max(args.pause_seconds, 0))
+            log_line("[PAUSE-END] resumed")
+        log_line(f"[PROGRESS] {index}/{total} -> {url}")
         try:
             data = scrape_url(url, args.browser_profile)
             result = export_result(data, output_dir, formats)
             results.append({"ok": True, **result})
-            print(f"[OK] {url}")
+            log_line(f"[OK] {url}")
+            exported = [path for key, path in result.items() if key in {"json", "html", "docx", "pdf"} and path]
+            if exported:
+                log_line(f"[EXPORTED] {' | '.join(exported)}")
         except (
             urllib.error.URLError,
             RuntimeError,
@@ -985,7 +1886,7 @@ def main() -> int:
             subprocess.TimeoutExpired,
         ) as exc:
             results.append({"ok": False, "url": url, "error": str(exc)})
-            print(f"[ERR] {url} -> {exc}", file=sys.stderr)
+            log_error(f"[ERR] {url} -> {exc}")
 
     return 0 if all(item.get("ok") for item in results) else 1
 

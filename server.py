@@ -6,7 +6,9 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
+import uuid
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -15,9 +17,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SCRAPER = ROOT / "batch_chasedream_scraper.py"
-DEFAULT_OUTPUT = Path(r"D:\openclaw\文案内容")
+DEFAULT_OUTPUT = Path(r"C:\Users\Administrator\openclaw-output")
 UPLOAD_DIR = ROOT / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+JOBS = {}
+JOBS_LOCK = threading.Lock()
 
 
 HTML_PAGE = """<!doctype html>
@@ -241,7 +245,7 @@ HTML_PAGE = """<!doctype html>
         </div>
         <div>
           <label for="output">Output Folder</label>
-          <input id="output" type="text" value="D:\\openclaw\\文案内容">
+          <input id="output" type="text" value="C:\\Users\\Administrator\\openclaw-output">
           <div style="margin-top:14px;">
             <label>Keyword Sites</label>
             <div class="checks">
@@ -291,6 +295,29 @@ HTML_PAGE = """<!doctype html>
       document.getElementById('urls').value = await file.text();
     });
 
+    let activeJob = null;
+
+    async function pollJob(jobId) {
+      const result = document.getElementById('result');
+      while (activeJob === jobId) {
+        try {
+          const res = await fetch('/job/' + jobId, { cache: 'no-store' });
+          const data = await res.json();
+          result.textContent = (data.log || '').trim() || 'Running...';
+          if (data.done) {
+            result.textContent = JSON.stringify(data.result, null, 2);
+            activeJob = null;
+            break;
+          }
+        } catch (err) {
+          result.textContent += '\\n[UI] 轮询任务状态失败：' + String(err);
+          activeJob = null;
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
     document.getElementById('run-btn').addEventListener('click', async () => {
       const urls = document.getElementById('urls').value.trim();
       const keyword = document.getElementById('keyword').value.trim();
@@ -313,15 +340,30 @@ HTML_PAGE = """<!doctype html>
 
       const result = document.getElementById('result');
       result.textContent = 'Running...';
-      const res = await fetch('/run', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ urls, keyword, keywordSites, keywordLimit, output, formats })
-      });
-      result.textContent = JSON.stringify(await res.json(), null, 2);
+      try {
+        const res = await fetch('/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
+          body: JSON.stringify({ urls, keyword, keywordSites, keywordLimit, output, formats })
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          result.textContent = JSON.stringify(data, null, 2);
+          return;
+        }
+        activeJob = data.jobId;
+        result.textContent = '任务已提交，正在启动...\\n';
+        pollJob(data.jobId);
+      } catch (err) {
+        result.textContent = '[UI] 提交任务失败：' + String(err);
+      }
     });
 
-    loadStatus();
+    loadStatus().catch((err) => {
+      document.getElementById('frontend-text').textContent = 'Status check failed: ' + String(err);
+      document.getElementById('gateway-text').textContent = 'Status check failed: ' + String(err);
+    });
   </script>
 </body>
 </html>
@@ -353,7 +395,7 @@ def gateway_status():
             [cli, "gateway", "status"],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=3,
             check=False,
             shell=False,
         )
@@ -376,6 +418,80 @@ def gateway_status():
         return {"ok": False, "text": str(exc)}
 
 
+def create_job(cmd, output):
+    job_id = uuid.uuid4().hex
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "done": False,
+            "log": "",
+            "result": None,
+            "command": cmd,
+            "output": output,
+            "started_at": time.time(),
+        }
+    return job_id
+
+
+def append_job_log(job_id: str, chunk: str):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job["log"] += chunk
+        if len(job["log"]) > 50000:
+            job["log"] = job["log"][-50000:]
+
+
+def finish_job(job_id: str, result: dict):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job["done"] = True
+        job["result"] = result
+
+
+def run_job(job_id: str, cmd: list[str], output: str, tmp_path: str):
+    append_job_log(job_id, "$ " + " ".join(cmd) + "\n")
+    try:
+        child_env = os.environ.copy()
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            cwd=str(ROOT),
+            env=child_env,
+        )
+        lines: list[str] = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.append(line)
+            append_job_log(job_id, line)
+        code = proc.wait()
+        stdout_text = "".join(lines)
+        finish_job(
+            job_id,
+            {
+                "ok": code == 0,
+                "command": cmd,
+                "stdout": stdout_text,
+                "stderr": "",
+                "output": output,
+            },
+        )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 class Handler(BaseHTTPRequestHandler):
     def _json(self, payload, status=HTTPStatus.OK):
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -396,6 +512,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/status":
             self._json({"frontend": frontend_status(), "gateway": gateway_status()})
+            return
+        if self.path.startswith("/job/"):
+            job_id = self.path.split("/job/", 1)[1].strip()
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+            if not job:
+                self._json({"ok": False, "error": "Job not found"}, HTTPStatus.NOT_FOUND)
+                return
+            self._json({"ok": True, "done": job["done"], "log": job["log"], "result": job["result"]})
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -423,6 +548,7 @@ class Handler(BaseHTTPRequestHandler):
             tmp.close()
             cmd = [
                 sys.executable,
+                "-u",
                 str(SCRAPER),
                 "--input",
                 tmp.name,
@@ -436,21 +562,11 @@ class Handler(BaseHTTPRequestHandler):
                 if keyword_sites:
                     cmd.extend(["--keyword-sites", ",".join(keyword_sites)])
 
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900, check=False)
-            self._json(
-                {
-                    "ok": proc.returncode == 0,
-                    "command": cmd,
-                    "stdout": proc.stdout,
-                    "stderr": proc.stderr,
-                    "output": output,
-                }
-            )
+            job_id = create_job(cmd, output)
+            threading.Thread(target=run_job, args=(job_id, cmd, output, tmp.name), daemon=True).start()
+            self._json({"ok": True, "jobId": job_id, "command": cmd, "output": output})
         finally:
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
+            pass
 
 
 def main():
